@@ -1,0 +1,147 @@
+
+steps/online/nnet3/prepare_online_decoding.sh --mfcc-config conf/mfcc_hires.conf data/lang_chain exp/nnet3/extractor exp/chain/tdnn_7b exp/tdnn_7b_chain_online
+
+utils/mkgraph.sh --self-loop-scale 1.0 data/lang_pp_test exp/tdnn_7b_chain_online exp/tdnn_7b_chain_online/graph_pp
+
+ffmpeg -i  -acodec pcm_s16le -ac 1 -ar 8000 
+
+online2-wav-nnet3-latgen-faster \
+  --online=false \
+  --do-endpointing=false \
+  --frame-subsampling-factor=3 \
+  --config=exp/tdnn_7b_chain_online/conf/online.conf \
+  --max-active=7000 \
+  --beam=15.0 \
+  --lattice-beam=6.0 \
+  --acoustic-scale=1.0 \
+  --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt \
+  exp/tdnn_7b_chain_online/final.mdl \
+  exp/tdnn_7b_chain_online/graph_pp/HCLG.fst \
+  'ark:echo utterance-id1 utterance-id1|' \
+  'scp:echo utterance-id1 |' \
+  'ark:/dev/null'
+
+
+grep -oE "[A-Za-z\\-\\']{3,}" corpus.txt | tr '[:lower:]' '[:upper:]' | sort | uniq > words.txt
+https://www-i6.informatik.rwth-aachen.de/web/Software/g2p.html
+https://chrisearch.files.wordpress.com/2017/03/model-b.key
+
+
+
+g2p.py --model model-7 --apply words.txt > words.dic
+
+
+cat corpus.txt | tr '[:lower:]' '[:upper:]' > corpus_upper.txt
+
+
+ngram-count -text corpus_upper.txt -order 3 -limit-vocab -vocab words.txt -unk -map-unk "" -kndiscount -interpolate -lm lm.arpa
+
+
+import io
+import re
+import sys
+import collections
+ 
+if len(sys.argv) != 7:
+    print(sys.argv[0] + "      ")
+    sys.exit(2)
+ 
+[basedic, baselm, extdic, extlm, outdic, outlm] = sys.argv[1:7]
+ 
+print("Merging dictionaries...")
+ 
+words = collections.OrderedDict()
+for dic in [basedic, extdic]:
+    with io.open(dic, 'r+') as Fdic:
+        for line in Fdic:
+            arr = line.strip().replace("\t", " ").split(" ", 1) # Sometimes tabs are used
+            [word, pronunciation] = arr
+            word = word.lower()
+            if word not in words:
+                words[word] = set([pronunciation.lower()])
+            else:
+                words[word].add(pronunciation.lower())
+ 
+with io.open(outdic, 'w', newline='\n') as Foutdic:
+    for word in words:
+        for pronunciation in words[word]:
+            Foutdic.write(word + " " + pronunciation + "\n")
+ 
+print("Merging language models...")
+ 
+# Read LM entries - works only on 3-gram models at most
+grams = [[], [], []]
+for lm in [baselm, extlm]:
+    with io.open(lm, 'r+') as Flm:
+        mode = 0
+        for line in Flm:
+            line = line.strip()
+            if line == "\\1-grams:": mode = 1
+            if line == "\\2-grams:": mode = 2
+            if line == "\\3-grams:": mode = 3
+            arr = line.split()
+            if mode > 0 and len(arr) > 1:
+                if mode == 1 or mode == 2:
+                    word = " ".join(arr[2:-1] if mode < 3 else arr[2:])
+                    word = word.lower()
+                grams[mode - 1].append(line.lower())
+ 
+with io.open(outlm, 'w', newline='\n') as Foutlm:
+    Foutlm.write(
+       u"\\data\\\n" +
+       u"ngram 1=" + str(len(grams[0])) + "\n"
+       u"ngram 2=" + str(len(grams[1])) + "\n"
+       u"ngram 3=" + str(len(grams[2])) + "\n"
+    )
+    for i in range(3):
+        Foutlm.write(u"\n\\" + str(i+1) + u"-grams:\n")
+        for g in grams[i]:
+            Foutlm.write(g + "\n")
+ 
+    Foutlm.write(u"\n\\end\\\n")
+
+# Set up the environment variables (again)
+. cmd.sh
+. path.sh
+ 
+# Set the paths of our input files into variables
+model=exp/tdnn_7b_chain_online
+phones_src=exp/tdnn_7b_chain_online/phones.txt
+dict_src=new/local/dict
+lm_src=new/local/lang/lm.arpa
+ 
+lang=new/lang
+dict=new/dict
+dict_tmp=new/dict_tmp
+graph=new/graph
+ 
+# Compile the word lexicon (L.fst)
+utils/prepare_lang.sh --phone-symbol-table $phones_src $dict_src "" $dict_tmp $dict
+ 
+# Compile the grammar/language model (G.fst)
+gzip  $lm_src.gz
+utils/format_lm.sh $dict $lm_src.gz $dict_src/lexicon.txt $lang
+ 
+# Finally assemble the HCLG graph
+utils/mkgraph.sh --self-loop-scale 1.0 $lang $model $graph
+ 
+# To use our newly created model, we must also build a decoding configuration, the following line will create these for us into the new/conf directory
+steps/online/nnet3/prepare_online_decoding.sh --mfcc-config conf/mfcc_hires.conf $dict exp/nnet3/extractor exp/chain/tdnn_7b new
+
+online2-wav-nnet3-latgen-faster \
+  --online=false \
+  --do-endpointing=false \
+  --frame-subsampling-factor=3 \
+  --config=new/conf/online.conf \
+  --max-active=7000 \
+  --beam=15.0 \
+  --lattice-beam=6.0 \
+  --acoustic-scale=1.0 \
+  --word-symbol-table=new/graph/words.txt \
+  exp/tdnn_7b_chain_online/final.mdl \
+  new/graph/HCLG.fst \
+  'ark:echo utterance-id1 utterance-id1|' \
+  'scp:echo utterance-id1 |' \
+  'ark:/dev/null'
+
+
